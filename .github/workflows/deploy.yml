@@ -1,0 +1,108 @@
+name: Deploy to DigitalOcean
+
+on:
+  push:
+    branches: [main]
+
+concurrency:
+  group: deploy-transport
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      IMAGE: ghcr.io/tscode-com-br/checking-transport
+      OCEAN_PORT: ${{ secrets.OCEAN_PORT != '' && secrets.OCEAN_PORT || '22' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Validate deploy secrets
+        id: validate_secrets
+        env:
+          OCEAN_HOST: ${{ secrets.OCEAN_HOST }}
+          OCEAN_USER: ${{ secrets.OCEAN_USER }}
+          OCEAN_SSH_KEY: ${{ secrets.OCEAN_SSH_KEY }}
+          OCEAN_APP_DIR: ${{ secrets.OCEAN_APP_DIR }}
+        run: |
+          set -e
+          missing=""
+          test -n "$OCEAN_HOST"    || missing="$missing OCEAN_HOST"
+          test -n "$OCEAN_USER"    || missing="$missing OCEAN_USER"
+          test -n "$OCEAN_SSH_KEY" || missing="$missing OCEAN_SSH_KEY"
+          test -n "$OCEAN_APP_DIR" || missing="$missing OCEAN_APP_DIR"
+          if [ -n "$missing" ]; then
+            echo "::warning::Deploy secrets not configured — image will be built but server deploy will be skipped. Missing:$missing"
+            echo "can_deploy=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "can_deploy=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build and push Docker image
+        run: |
+          set -euo pipefail
+          echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker pull "$IMAGE:main" || true
+          docker build \
+            --pull \
+            --cache-from "$IMAGE:main" \
+            -t "$IMAGE:${{ github.sha }}" \
+            -t "$IMAGE:main" \
+            .
+          docker push "$IMAGE:${{ github.sha }}"
+          docker push "$IMAGE:main"
+          docker logout ghcr.io || true
+
+      - name: Deploy via SSH
+        if: steps.validate_secrets.outputs.can_deploy == 'true'
+        uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2 # v1.2.5
+        with:
+          host: ${{ secrets.OCEAN_HOST }}
+          username: ${{ secrets.OCEAN_USER }}
+          key: ${{ secrets.OCEAN_SSH_KEY }}
+          port: ${{ env.OCEAN_PORT }}
+          timeout: 60s
+          command_timeout: 10m
+          script: |
+            set -e
+            cd '${{ secrets.OCEAN_APP_DIR }}'
+            IMAGE='ghcr.io/tscode-com-br/checking-transport:${{ github.sha }}'
+            TEMP_DOCKER_CONFIG="$(mktemp -d)"
+            cleanup() { rm -rf "$TEMP_DOCKER_CONFIG"; }
+            trap cleanup EXIT
+            export DOCKER_CONFIG="$TEMP_DOCKER_CONFIG"
+            printf '%s' '${{ github.token }}' | docker login ghcr.io -u '${{ github.actor }}' --password-stdin
+            CHECKCHECK_TRANSPORT_WEB_IMAGE="$IMAGE" docker compose -f docker-compose.websites.yml pull transport-web
+            docker logout ghcr.io || true
+            CHECKCHECK_TRANSPORT_WEB_IMAGE="$IMAGE" docker compose -f docker-compose.websites.yml up -d --no-build --force-recreate transport-web
+
+      - name: Validate transport health
+        if: steps.validate_secrets.outputs.can_deploy == 'true'
+        uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2 # v1.2.5
+        with:
+          host: ${{ secrets.OCEAN_HOST }}
+          username: ${{ secrets.OCEAN_USER }}
+          key: ${{ secrets.OCEAN_SSH_KEY }}
+          port: ${{ env.OCEAN_PORT }}
+          timeout: 60s
+          command_timeout: 2m
+          script: |
+            set -e
+            for i in $(seq 1 10); do
+              status=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:18083/ || true)
+              if [ "$status" = "200" ]; then
+                echo "transport-web healthy (HTTP $status)"
+                exit 0
+              fi
+              echo "Attempt $i: HTTP $status — retrying in 3s…"
+              sleep 3
+            done
+            echo "::error::transport-web did not become healthy after 10 attempts"
+            exit 1
